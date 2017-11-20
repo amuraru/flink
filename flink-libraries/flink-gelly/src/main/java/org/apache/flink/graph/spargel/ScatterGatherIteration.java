@@ -19,14 +19,13 @@
 package org.apache.flink.graph.spargel;
 
 import org.apache.flink.api.common.aggregators.Aggregator;
-import org.apache.flink.api.common.functions.FlatJoinFunction;
-import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.functions.RichCoGroupFunction;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.api.java.operators.CoGroupOperator;
 import org.apache.flink.api.java.operators.CustomUnaryOperation;
 import org.apache.flink.api.java.operators.DeltaIteration;
+import org.apache.flink.api.java.operators.IterativeDataSet;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
@@ -175,7 +174,8 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 		// check whether the degrees option is set and, if so, compute the in and the out degrees and
 		// add them to the vertex value
 		if(this.configuration != null && this.configuration.isOptDegrees()) {
-			return createResultVerticesWithDegrees(graph, messagingDirection, messageTypeInfo, numberOfVertices);
+			throw  new IllegalArgumentException("Not supported in batch mode yet");
+//			return createResultVerticesWithDegrees(graph, messagingDirection, messageTypeInfo, numberOfVertices);
 		} else {
 			return createResultSimpleVertex(messagingDirection, messageTypeInfo, numberOfVertices);
 		}
@@ -368,6 +368,7 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 	@SuppressWarnings("serial")
 	private static final class GatherUdfSimpleVV<K, VV, Message> extends GatherUdf<K, VV, Message> {
 
+		private boolean inBulkIteration = true;
 		private GatherUdfSimpleVV(GatherFunction<K, VV, Message> gatherFunction, TypeInformation<Vertex<K, VV>> resultType) {
 			super(gatherFunction, resultType);
 		}
@@ -387,6 +388,9 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 
 				gatherFunction.setOutput(vertexState, out);
 				gatherFunction.updateVertex(vertexState, messageIter);
+				if(inBulkIteration && !gatherFunction.lastVertexCollected()) {
+					out.collect(vertexState);
+				}
 			}
 			else {
 				final Iterator<Tuple2<K, Message>> messageIter = messages.iterator();
@@ -463,16 +467,16 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 	 * @return the scatter function
 	 */
 	private CoGroupOperator<?, ?, Tuple2<K, Message>> buildScatterFunction(
-			DeltaIteration<Vertex<K, VV>, Vertex<K, VV>> iteration,
-			TypeInformation<Tuple2<K, Message>> messageTypeInfo, int whereArg, int equalToArg,
-			DataSet<LongValue> numberOfVertices) {
+		IterativeDataSet<Vertex<K, VV>> iteration,
+		TypeInformation<Tuple2<K, Message>> messageTypeInfo, int whereArg, int equalToArg,
+		DataSet<LongValue> numberOfVertices) {
 
 		// build the scatter function (co group)
 		CoGroupOperator<?, ?, Tuple2<K, Message>> messages;
 		ScatterUdfWithEdgeValues<K, VV, VV, Message, EV> messenger =
 				new ScatterUdfWithEVsSimpleVV<>(scatterFunction, messageTypeInfo);
 
-		messages = this.edgesWithValue.coGroup(iteration.getWorkset()).where(whereArg)
+		messages = this.edgesWithValue.coGroup(iteration).where(whereArg)
 				.equalTo(equalToArg).with(messenger);
 
 		// configure coGroup message function with name and broadcast variables
@@ -534,14 +538,13 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 	 * @param iteration
 	 */
 
-	private void setUpIteration(DeltaIteration<?, ?> iteration) {
+	private void setUpIteration(IterativeDataSet<?> iteration) {
 
 		// set up the iteration operator
 		if (this.configuration != null) {
 
 			iteration.name(this.configuration.getName("Scatter-gather iteration (" + gatherFunction + " | " + scatterFunction + ")"));
-			iteration.parallelism(this.configuration.getParallelism());
-			iteration.setSolutionSetUnManaged(this.configuration.isSolutionSetUnmanagedMemory());
+			iteration.setParallelism(this.configuration.getParallelism());
 
 			// register all aggregators
 			for (Map.Entry<String, Aggregator<?>> entry : this.configuration.getAggregators().entrySet()) {
@@ -569,9 +572,9 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 
 		TypeInformation<Vertex<K, VV>> vertexTypes = initialVertices.getType();
 
-		final DeltaIteration<Vertex<K, VV>, Vertex<K, VV>> iteration =
-				initialVertices.iterateDelta(initialVertices, this.maximumNumberOfIterations, 0);
-				setUpIteration(iteration);
+		final IterativeDataSet<Vertex<K, VV>> iteration =
+				initialVertices.iterate(this.maximumNumberOfIterations);
+		setUpIteration(iteration);
 
 		switch (messagingDirection) {
 			case IN:
@@ -592,7 +595,7 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 
 		// build the update function (co group)
 		CoGroupOperator<?, ?, Vertex<K, VV>> updates =
-				messages.coGroup(iteration.getSolutionSet()).where(0).equalTo(0).with(updateUdf);
+				messages.coGroup(iteration).where(0).equalTo(0).with(updateUdf);
 
 		if (this.configuration != null && this.configuration.isOptNumVertices()) {
 			updates = updates.withBroadcastSet(numberOfVertices, "number of vertices");
@@ -616,77 +619,7 @@ public class ScatterGatherIteration<K, VV, Message, EV>
 	@SuppressWarnings("serial")
 	private DataSet<Vertex<K, VV>> createResultVerticesWithDegrees(Graph<K, VV, EV> graph, EdgeDirection messagingDirection,
 			TypeInformation<Tuple2<K, Message>> messageTypeInfo, DataSet<LongValue> numberOfVertices) {
-
-		DataSet<Tuple2<K, Message>> messages;
-
-		this.gatherFunction.setOptDegrees(this.configuration.isOptDegrees());
-
-		DataSet<Tuple2<K, LongValue>> inDegrees = graph.inDegrees();
-		DataSet<Tuple2<K, LongValue>> outDegrees = graph.outDegrees();
-
-		DataSet<Tuple3<K, LongValue, LongValue>> degrees = inDegrees.join(outDegrees).where(0).equalTo(0)
-				.with(new FlatJoinFunction<Tuple2<K, LongValue>, Tuple2<K, LongValue>, Tuple3<K, LongValue, LongValue>>() {
-
-					@Override
-					public void join(Tuple2<K, LongValue> first, Tuple2<K, LongValue> second, Collector<Tuple3<K, LongValue, LongValue>> out) {
-						out.collect(new Tuple3<>(first.f0, first.f1, second.f1));
-					}
-				}).withForwardedFieldsFirst("f0;f1").withForwardedFieldsSecond("f1");
-
-		DataSet<Vertex<K, Tuple3<VV, LongValue, LongValue>>> verticesWithDegrees = initialVertices
-				.join(degrees).where(0).equalTo(0)
-				.with(new FlatJoinFunction<Vertex<K, VV>, Tuple3<K, LongValue, LongValue>, Vertex<K, Tuple3<VV, LongValue, LongValue>>>() {
-					@Override
-					public void join(Vertex<K, VV> vertex, Tuple3<K, LongValue, LongValue> degrees,
-									Collector<Vertex<K, Tuple3<VV, LongValue, LongValue>>> out) throws Exception {
-						out.collect(new Vertex<>(vertex.getId(),
-									new Tuple3<>(vertex.getValue(), degrees.f1, degrees.f2)));
-					}
-				}).withForwardedFieldsFirst("f0");
-
-		// add type info
-		TypeInformation<Vertex<K, Tuple3<VV, LongValue, LongValue>>> vertexTypes = verticesWithDegrees.getType();
-
-		final DeltaIteration<Vertex<K, Tuple3<VV, LongValue, LongValue>>, Vertex<K, Tuple3<VV, LongValue, LongValue>>> iteration =
-				verticesWithDegrees.iterateDelta(verticesWithDegrees, this.maximumNumberOfIterations, 0);
-				setUpIteration(iteration);
-
-		switch (messagingDirection) {
-			case IN:
-				messages = buildScatterFunctionVerticesWithDegrees(iteration, messageTypeInfo, 1, 0, numberOfVertices);
-				break;
-			case OUT:
-				messages = buildScatterFunctionVerticesWithDegrees(iteration, messageTypeInfo, 0, 0, numberOfVertices);
-				break;
-			case ALL:
-				messages = buildScatterFunctionVerticesWithDegrees(iteration, messageTypeInfo, 1, 0, numberOfVertices)
-						.union(buildScatterFunctionVerticesWithDegrees(iteration, messageTypeInfo, 0, 0, numberOfVertices)) ;
-				break;
-			default:
-				throw new IllegalArgumentException("Illegal edge direction");
-		}
-
-		@SuppressWarnings({ "unchecked", "rawtypes" })
-		GatherUdf<K, Tuple3<VV, LongValue, LongValue>, Message> updateUdf =
-				new GatherUdfVVWithDegrees(gatherFunction, vertexTypes);
-
-		// build the update function (co group)
-		CoGroupOperator<?, ?, Vertex<K, Tuple3<VV, LongValue, LongValue>>> updates =
-				messages.coGroup(iteration.getSolutionSet()).where(0).equalTo(0).with(updateUdf);
-
-		if (this.configuration != null && this.configuration.isOptNumVertices()) {
-			updates = updates.withBroadcastSet(numberOfVertices, "number of vertices");
-		}
-
-		configureUpdateFunction(updates);
-
-		return iteration.closeWith(updates, updates).map(
-				new MapFunction<Vertex<K, Tuple3<VV, LongValue, LongValue>>, Vertex<K, VV>>() {
-
-					public Vertex<K, VV> map(Vertex<K, Tuple3<VV, LongValue, LongValue>> vertex) {
-						return new Vertex<>(vertex.getId(), vertex.getValue().f0);
-					}
-				});
+		throw new IllegalStateException("Not supported");
 	}
 
 	private <VVWithDegree> void configureUpdateFunction(CoGroupOperator<?, ?, Vertex<K, VVWithDegree>> updates) {

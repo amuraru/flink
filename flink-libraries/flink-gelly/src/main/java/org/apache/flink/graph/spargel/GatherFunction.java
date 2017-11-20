@@ -47,6 +47,7 @@ public abstract class GatherFunction<K, VV, Message> implements Serializable {
 	// --------------------------------------------------------------------------------------------
 
 	private long numberOfVertices = -1L;
+	private boolean lastVertexCollected = false;
 
 	/**
 	 * Retrieves the number of vertices in the graph.
@@ -121,7 +122,12 @@ public abstract class GatherFunction<K, VV, Message> implements Serializable {
 		} else {
 			outVal.setValue(newValue);
 			out.collect(outVal);
+			this.lastVertexCollected = true;
 		}
+	}
+
+	public boolean lastVertexCollected() {
+		return lastVertexCollected;
 	}
 
 	/**
@@ -194,6 +200,7 @@ public abstract class GatherFunction<K, VV, Message> implements Serializable {
 		this.outVal = outVal;
 		this.out = out;
 		setNewVertexValueCalled = false;
+		this.lastVertexCollected = false;
 	}
 
 	@SuppressWarnings({ "unchecked", "rawtypes" })
